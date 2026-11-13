@@ -1,0 +1,113 @@
+name: Rebuild and sign IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      validator_url:
+        description: "URL HTTPS completa do endpoint tRPC ipa.validate"
+        required: true
+        default: "https://keypanel-qvtyssux.manus.space/api/trpc/ipa.validate"
+      source_ipa:
+        description: "Nome da IPA no repositório"
+        required: true
+        default: "REAL EXTERNAL_v1.2.1_44755.ipa"
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    env:
+      SOURCE_IPA: ${{ inputs.source_ipa }}
+      VALIDATOR_URL: ${{ inputs.validator_url }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      SIGNING_CERTIFICATE_BASE64: ${{ secrets.SIGNING_CERTIFICATE_BASE64 }}
+      PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install signing certificate and provisioning profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${KEYCHAIN_PASSWORD:?Missing KEYCHAIN_PASSWORD secret}"
+          : "${P12_PASSWORD:?Missing P12_PASSWORD secret}"
+          : "${SIGNING_CERTIFICATE_BASE64:?Missing SIGNING_CERTIFICATE_BASE64 secret}"
+          : "${PROVISIONING_PROFILE_BASE64:?Missing PROVISIONING_PROFILE_BASE64 secret}"
+          CERT_PATH="$RUNNER_TEMP/signing.p12"
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo "$SIGNING_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print:UUID' "$PROFILE_PLIST")
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          /usr/libexec/PlistBuddy -c 'Print:Name' "$PROFILE_PLIST" > "$RUNNER_TEMP/profile-name"
+          echo "SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/1\)/ {print $2; exit}')" >> "$GITHUB_ENV"
+          echo "PROFILE_PLIST=$PROFILE_PLIST" >> "$GITHUB_ENV"
+
+      - name: Patch validator endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf patched Payload
+          mkdir patched
+          unzip -q "$SOURCE_IPA" -d patched
+          python3 - "$VALIDATOR_URL" <<'PY'
+          import pathlib, sys
+          new = sys.argv[1].encode()
+          old = b"https://keyforgechat-9zmsgzua.manus.space/api/trpc/ipa.validate"
+          found = 0
+          for path in pathlib.Path("patched/Payload").rglob("*"):
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              count = data.count(old)
+              if count:
+                  if len(new) > len(old):
+                      raise SystemExit(f"New URL is longer than the embedded URL in {path}")
+                  path.write_bytes(data.replace(old, new + b"\\0" * (len(old) - len(new))))
+                  found += count
+          if found == 0:
+              raise SystemExit("Old validator URL was not found; refusing to produce an unchanged IPA")
+          print(f"Replaced {found} endpoint occurrence(s)")
+          PY
+
+      - name: Re-sign IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find patched/Payload -maxdepth 1 -type d -name '*.app' | head -1)
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          cp "$PROFILE_PATH" "$APP_PATH/embedded.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          ENTITLEMENTS="$RUNNER_TEMP/entitlements.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print:Entitlements' "$PROFILE_PLIST" > "$ENTITLEMENTS"
+          codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS" --timestamp=none "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          rm -f "patched/Payload/$(basename "$APP_PATH").app/embedded.mobileprovision" 2>/dev/null || true
+          cp "$PROFILE_PATH" "$APP_PATH/embedded.mobileprovision"
+          OUT="REAL-EXTERNAL-keypanel-signed.ipa"
+          (cd patched && zip -qry9 "../$OUT" Payload)
+          unzip -tq "$OUT"
+          echo "OUTPUT_IPA=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-external-keypanel-signed
+          path: ${{ env.OUTPUT_IPA }}
+          if-no-files-found: error
+          retention-days: 14
