@@ -1,0 +1,70 @@
+name: Patch IPA for GBox
+
+on:
+  workflow_dispatch:
+    inputs:
+      validator_url:
+        description: "URL HTTPS completa do endpoint tRPC ipa.validate"
+        required: true
+        default: "https://keypanel-qvtyssux.manus.space/api/trpc/ipa.validate"
+      source_ipa:
+        description: "IPA nova usada como origem"
+        required: true
+        default: "EXTERNALBYPASSIOSCORRIGIDO.ipa"
+
+jobs:
+  patch:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    env:
+      SOURCE_IPA: ${{ inputs.source_ipa }}
+      VALIDATOR_URL: ${{ inputs.validator_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Replace validator endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf patched
+          mkdir -p patched
+          unzip -q "$SOURCE_IPA" -d patched
+          python3 - "$VALIDATOR_URL" <<'PY'
+          import pathlib, sys
+          new = sys.argv[1].encode()
+          old = b"https://keyforgechat-9zmsgzua.manus.space/api/trpc/ipa.validate"
+          found = 0
+          for path in pathlib.Path("patched/Payload").rglob("*"):
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              count = data.count(old)
+              if count:
+                  if len(new) > len(old):
+                      raise SystemExit(f"New URL is longer than the embedded URL in {path}")
+                  path.write_bytes(data.replace(old, new + b"\x00" * (len(old) - len(new))))
+                  found += count
+          if found == 0:
+              raise SystemExit("Old validator URL was not found; refusing to produce an unchanged IPA")
+          print(f"Replaced {found} endpoint occurrence(s)")
+          PY
+
+      - name: Package IPA for GBox
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="EXTERNALBYPASSIOSCORRIGIDO-keypanel-gbox.ipa"
+          (cd patched && zip -qry9 "../$OUT" Payload)
+          unzip -tq "$OUT"
+          echo "Created unsigned IPA for GBox: $OUT"
+
+      - name: Upload patched IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-bypass-keypanel-gbox
+          path: EXTERNALBYPASSIOSCORRIGIDO-keypanel-gbox.ipa
+          if-no-files-found: error
+          retention-days: 14
