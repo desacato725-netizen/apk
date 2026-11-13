@@ -10,7 +10,7 @@ on:
       legacy_login_url:
         description: "URL compatível com o login PHP usado pela tela da IPA"
         required: true
-        default: "https://keypanel-qvtyssux.manus.space/l"
+        default: "https://keypanel-qvtyssux.manus.space/api/l"
       source_ipa:
         description: "IPA nova usada como origem"
         required: true
