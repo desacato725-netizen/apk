@@ -10,7 +10,7 @@ on:
       source_ipa:
         description: "Nome da IPA no repositório"
         required: true
-        default: "REAL EXTERNAL_v1.2.1_44755.ipa"
+        default: "EXTERNALBYPASSIOSCORRIGIDO.ipa"
 
 jobs:
   build:
